@@ -626,14 +626,21 @@ class Dataset(AbstractDataset):
                     heading = -obj2sensor.rotation.as_euler("YZX")[0] - np.pi / 2  # type: ignore
                 else:
                     heading = obj2coords.rotation.as_euler("ZYX")[0]  # type: ignore
-                out.append(
-                    dataclasses.replace(
-                        b,
-                        center=obj2coords.apply([0, 0, 0]),
-                        heading=heading,
-                        transform=obj2coords,
-                    )
+
+                new_vals = dict(
+                    center=obj2coords.apply([0, 0, 0]),
+                    heading=heading,
+                    transform=obj2coords,
                 )
+
+                if hasattr(b, "velocity"):
+                    # Rotate velocity vector by the transformation
+                    # Vector rotation = T(v) - T(0)
+                    new_vals["velocity"] = ann2coords.apply(b.velocity) - ann2coords.apply(
+                        np.array([0.0, 0.0, 0.0])
+                    )
+
+                out.append(dataclasses.replace(b, **new_vals))
 
             return out
 
@@ -667,14 +674,21 @@ class Dataset(AbstractDataset):
                 b2.transform,  # type: ignore
                 w,  # type: ignore
             )
-            out.append(
-                dataclasses.replace(
-                    b1,
-                    center=obj2coords.apply([0, 0, 0]),
-                    heading=obj2coords.rotation.as_euler("ZYX")[0],
-                    transform=obj2coords,
-                )
+
+            new_vals = dict(
+                center=obj2coords.apply([0, 0, 0]),
+                heading=obj2coords.rotation.as_euler("ZYX")[0],
+                transform=obj2coords,
             )
+
+            if hasattr(b1, "velocity"):
+                # Interpolate velocity then rotate
+                v_interp = (1 - w) * b1.velocity + w * b2.velocity
+                new_vals["velocity"] = ann2coords.apply(v_interp) - ann2coords.apply(
+                    np.array([0.0, 0.0, 0.0])
+                )
+
+            out.append(dataclasses.replace(b1, **new_vals))
 
         return out
 
