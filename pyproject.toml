@@ -9,9 +9,10 @@ description = "A unified interface to various 3D driving datasets"
 readme = "README.md"
 license = "CECILL-C"
 authors = [ { name = "Nicolas Granger", email = "nicolas.granger@cea.fr" } ]
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 classifiers = [
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",

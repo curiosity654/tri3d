@@ -1,6 +1,7 @@
 import itertools
 from abc import ABC, abstractmethod
-from typing import Iterator, Literal, Self, overload
+from typing import Iterator, Literal, overload
+from typing_extensions import Self
 
 import numpy as np
 
@@ -188,7 +189,7 @@ class AffineTransform(Transformation):
         x = np.asarray(x)
 
         return (
-            np.linalg.vecdot(self.mat[..., :3, :3], np.expand_dims(x, -2))
+            (self.mat[..., :3, :3] @ x[..., None]).squeeze(-1)
             + self.mat[..., :3, 3]
         )
 
@@ -243,7 +244,7 @@ class Rotation(Transformation):
 
     def apply(self, x) -> np.ndarray:
         x = np.asarray(x)
-        return np.linalg.vecdot(np.expand_dims(x, -2), self.mat)
+        return (self.mat @ x[..., None]).squeeze(-1)
 
     def inv(self):
         return Rotation(self.quat * np.array([1, -1, -1, -1], dtype=self.quat.dtype))
