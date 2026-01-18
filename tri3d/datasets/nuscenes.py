@@ -133,7 +133,7 @@ val = \
      'scene-1068', 'scene-1069', 'scene-1070', 'scene-1071', 'scene-1072', 'scene-1073']
 
 val_mini = \
-    ['scene-0003']
+    ['scene-0098', 'scene-0099', 'scene-0100', 'scene-0101', 'scene-0102', 'scene-0103',]
 
 @dataclasses.dataclass(frozen=True)
 class NuScenesBox(Box):
@@ -277,6 +277,19 @@ class NuScenes(Dataset):
             elif s["modality"] == "lidar":
                 self.pcl_sensors.append(s["channel"])
 
+        if self.cam_sensors:
+            nusc_cam_order = [
+                "CAM_FRONT",
+                "CAM_FRONT_RIGHT",
+                "CAM_FRONT_LEFT",
+                "CAM_BACK",
+                "CAM_BACK_LEFT",
+                "CAM_BACK_RIGHT",
+            ]
+            if set(nusc_cam_order).issubset(set(self.cam_sensors)):
+                self.cam_sensors = [c for c in nusc_cam_order if c in self.cam_sensors]
+                self.img_sensors = [c.replace("CAM", "IMG") for c in self.cam_sensors]
+
         # extract label names
         self.det_labels = [c["name"] for c in category.values()]
         self.sem_labels = self.det_labels
@@ -401,7 +414,7 @@ class NuScenes(Dataset):
                 if channel not in self.pcl_sensors and channel not in self.cam_sensors:
                     continue
 
-                calib = calibrated_sensor[channel_data_v[0]["calibrated_sensor_token"]]
+                calib = calibrated_sensor[channel_data_v[0]["calibrated_sensor_token"]].copy()
 
                 if channel in self.pcl_sensors:
                     calib["rotation"] = (
