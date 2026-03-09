@@ -4,6 +4,7 @@ SimBEV is a synthetic multi-task multi-sensor driving data generation tool.
 This dataset class provides an interface to load SimBEV data in Tri3D format.
 """
 import json
+import sys
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -101,10 +102,11 @@ class SimBEV(Dataset):
             return RigidTransform(Rotation.from_euler("Z", 0.0), [0.0, 0.0, 0.0])
 
         if src_sensor in self.cam_sensors and dst_sensor in self.img_sensors:
-            fx = float(self.camera_intrinsics[0, 0])
-            fy = float(self.camera_intrinsics[1, 1])
-            cx = float(self.camera_intrinsics[0, 2])
-            cy = float(self.camera_intrinsics[1, 2])
+            intrinsics = self.camera_intrinsics_by_name.get(src_sensor, self.camera_intrinsics)
+            fx = float(intrinsics[0, 0])
+            fy = float(intrinsics[1, 1])
+            cx = float(intrinsics[0, 2])
+            cy = float(intrinsics[1, 2])
             return CameraProjection("pinhole", [fx, fy, cx, cy])
 
         if src_sensor in self.sensor_calib and dst_sensor in self.sensor_calib:
@@ -128,6 +130,12 @@ class SimBEV(Dataset):
         self.camera_intrinsics = np.array(
             self.metadata.get('camera_intrinsics', np.eye(3))
         )
+        self.camera_intrinsics_by_name = {}
+        intrinsics_by_name = self.metadata.get('camera_intrinsics_by_name', {})
+        if isinstance(intrinsics_by_name, dict):
+            self.camera_intrinsics_by_name = {
+                name: np.array(value) for name, value in intrinsics_by_name.items()
+            }
         self.sensor_calib = {}
         
         for sensor in ['LIDAR'] + self.cam_sensors:
@@ -156,18 +164,38 @@ class SimBEV(Dataset):
         if 'simbev' in parts:
             parts = parts[parts.index('simbev') + 1:]
 
-        parts = ['samples' if x == 'sweeps' else x for x in parts]
-        parts = ['ground_truth' if x == 'ground-truth' else x for x in parts]
-
-        # Try resolving under current dataset root first.
+        candidate_parts = []
         if len(parts) > 0:
-            candidate = self.root / Path(*parts)
+            # Prefer the path encoded in infos as-is. This is important for merged
+            # layouts that keep directories like `ground-truth/`.
+            candidate_parts.append(parts)
+
+            alias_parts = list(parts)
+            alias_applied = False
+            for idx, part in enumerate(alias_parts):
+                if part == 'sweeps':
+                    alias_parts[idx] = 'samples'
+                    alias_applied = True
+                elif part == 'samples':
+                    alias_parts[idx] = 'sweeps'
+                    alias_applied = True
+                elif part == 'ground-truth':
+                    alias_parts[idx] = 'ground_truth'
+                    alias_applied = True
+                elif part == 'ground_truth':
+                    alias_parts[idx] = 'ground-truth'
+                    alias_applied = True
+            if alias_applied and alias_parts not in candidate_parts:
+                candidate_parts.append(alias_parts)
+
+        for rel_parts in candidate_parts:
+            candidate = self.root / Path(*rel_parts)
             if candidate.exists():
                 return candidate
 
         # Fallback to root parent for layouts where info files and data root differ.
-        if len(parts) > 0:
-            candidate = self.root.parent / Path(*parts)
+        for rel_parts in candidate_parts:
+            candidate = self.root.parent / Path(*rel_parts)
             if candidate.exists():
                 return candidate
 
@@ -185,6 +213,25 @@ class SimBEV(Dataset):
         """
         rot = Rotation(rotation)
         return RigidTransform(rot, translation)
+
+    @staticmethod
+    def _patch_numpy_core_aliases():
+        import numpy.core as np_core
+
+        sys.modules.setdefault("numpy._core", np_core)
+        sys.modules.setdefault("numpy._core.multiarray", np.core.multiarray)
+        sys.modules.setdefault("numpy._core.numerictypes", np.core.numerictypes)
+        sys.modules.setdefault("numpy._core._multiarray_umath", np.core._multiarray_umath)
+
+    @classmethod
+    def _load_npy_allow_pickle_compat(cls, path: Path):
+        try:
+            return np.load(path, allow_pickle=True)
+        except ModuleNotFoundError as exc:
+            if "numpy._core" not in str(exc):
+                raise
+            cls._patch_numpy_core_aliases()
+            return np.load(path, allow_pickle=True)
     
     # ==================== Dataset Interface Implementation ====================
     
@@ -359,7 +406,7 @@ class SimBEV(Dataset):
         
         boxes = []
         try:
-            det_data = np.load(det_path, allow_pickle=True)
+            det_data = self._load_npy_allow_pickle_compat(det_path)
             for det in det_data:
                 if det.get('valid_flag') is False:
                     continue
@@ -379,6 +426,12 @@ class SimBEV(Dataset):
                     continue
 
                 center, size, heading = self._corners_to_box(corners)
+                raw_rotation = det.get('rotation')
+                if raw_rotation is not None:
+                    try:
+                        heading = self._rotation_to_heading(raw_rotation)
+                    except (TypeError, ValueError, IndexError):
+                        pass
                 if coords is not None and coords != 'world':
                     sensor2world = self.poses(seq_idx, coords)[frame_idx]
                     world2sensor = sensor2world.inv()
@@ -439,6 +492,18 @@ class SimBEV(Dataset):
 
         size = np.array([length, width, height], dtype=float)
         return center, size, heading
+
+    @staticmethod
+    def _rotation_to_heading(rotation: Union[np.ndarray, List[float], Tuple[float, ...]]) -> float:
+        """Convert SimBEV stored roll/pitch/yaw to a planar heading in radians.
+
+        SimBEV stores `rotation` in a right-handed coordinate frame, so yaw can
+        be used directly as the object's forward direction around +Z.
+        """
+        rotation = np.asarray(rotation, dtype=float).reshape(-1)
+        if rotation.shape[0] < 3:
+            raise ValueError("rotation must contain roll, pitch, yaw")
+        return float(np.deg2rad(rotation[2]))
     
     def calibration(self, seq_idx: int, sensor: str) -> dict:
         """Get calibration parameters for sensor.
@@ -464,11 +529,9 @@ class SimBEV(Dataset):
         Returns:
             Tuple of (width, height)
         """
-        # SimBEV uses standard camera intrinsics
-        # Image size can be inferred from camera matrix
-        # cx = width / 2, cy = height / 2
-        cx = self.camera_intrinsics[0, 2]
-        cy = self.camera_intrinsics[1, 2]
+        intrinsics = self.camera_intrinsics_by_name.get(sensor, self.camera_intrinsics)
+        cx = intrinsics[0, 2]
+        cy = intrinsics[1, 2]
         return (int(cx * 2), int(cy * 2))
     
     @property
