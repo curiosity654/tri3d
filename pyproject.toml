@@ -7,7 +7,7 @@ requires = [ "setuptools", "setuptools-scm" ]
 name = "tri3d"
 description = "A unified interface to various 3D driving datasets"
 readme = "README.md"
-license = "CECILL-C"
+license = { file = "LICENSE.txt" }
 authors = [ { name = "Nicolas Granger", email = "nicolas.granger@cea.fr" } ]
 requires-python = ">=3.10"
 classifiers = [
