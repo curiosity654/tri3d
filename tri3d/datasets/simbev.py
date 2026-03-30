@@ -66,36 +66,100 @@ class SimBEV(Dataset):
 
     det_labels = list(OBJECT_CLASSES.values())
     sem_labels: List[str] = []
-    
-    def __init__(self, root: str, split: str = 'train', **kwargs):
+
+    _CAM_SENSOR_ORDER = (
+        'CAM_FRONT_LEFT',
+        'CAM_FRONT',
+        'CAM_FRONT_RIGHT',
+        'CAM_BACK_LEFT',
+        'CAM_BACK',
+        'CAM_BACK_RIGHT',
+        'CAM_SIDE_LEFT',
+        'CAM_SIDE_RIGHT',
+    )
+
+    # SimBEV generated infos store camera poses in the raw simulator camera
+    # frame. Upstream SimBEV ships a conversion tool that right-multiplies
+    # camera rotations by this fixed quaternion to recover the "original"
+    # optical-frame convention expected by downstream pinhole projection:
+    # thirdparty/SimBEV/tools/convert_infos_camera_rotation_to_original.py
+    CAMERA_BASE_ROTATION = np.array([0.5, -0.5, 0.5, -0.5], dtype=np.float32)
+
+    def __init__(self,
+                 root: str,
+                 split: str = 'train',
+                 camera_rotation_convention: str = 'generated',
+                 **kwargs):
         self.root = Path(root)
         self.split = split
-        self._default_cam_sensor = self.cam_sensors[0]
         self._default_pcl_sensor = self.pcl_sensors[0]
         self._default_box_coords = self.pcl_sensors[0]
-        
+
         # Load SimBEV info file from infos directory
         info_path = self.root / 'infos' / f'simbev_infos_{split}.json'
         if not info_path.exists():
             raise FileNotFoundError(f"SimBEV info file not found: {info_path}")
-        
+
         with open(info_path) as f:
             self.infos = json.load(f)
-        
-        # Parse metadata
+
         self.metadata = self.infos.get('metadata', {})
-        self._parse_calibration()
-        
-        # Build scene index
         self._scenes = list(self.infos.get('data', {}).keys())
         if not self._scenes:
             raise ValueError("No scenes found in SimBEV dataset")
-        
+
+        # NuScenes-style exports use 6 cams; Waymo-style often omit rear RGB keys.
+        self._infer_camera_sensors_from_infos()
+        self.camera_rotation_convention = self._resolve_camera_rotation_convention(
+            camera_rotation_convention)
+        self._normalize_camera_rotations_in_metadata()
+        self._default_cam_sensor = self.cam_sensors[0]
+
+        self._parse_calibration()
+
         # Build frame index for each scene
         self._frames = {}
         for scene_id in self._scenes:
             scene_data = self.infos['data'][scene_id].get('scene_data', [])
             self._frames[scene_id] = list(range(len(scene_data)))
+
+    def _infer_camera_sensors_from_infos(self) -> None:
+        """Set instance cam_sensors / img_sensors from JSON RGB-* keys (per export)."""
+        rgb_prefix = 'RGB-'
+        found: set[str] = set()
+        # Union keys across the first scene's frames (handles sparse first frame).
+        first_scene = self._scenes[0]
+        for frame in self.infos['data'][first_scene].get('scene_data', []):
+            for k in frame:
+                if isinstance(k, str) and k.startswith(rgb_prefix):
+                    tail = k[len(rgb_prefix):]
+                    if tail:
+                        found.add(tail)
+
+        if not found:
+            return
+
+        meta_cams = self.metadata.get('cam_sensors')
+        if isinstance(meta_cams, list) and meta_cams:
+            meta_list = [str(x) for x in meta_cams]
+            ordered = [c for c in meta_list if c in found]
+            extra = sorted(found.difference(ordered))
+            self.cam_sensors = ordered + extra
+        else:
+            order = tuple(x for x in self._CAM_SENSOR_ORDER if x in found)
+            rest = tuple(sorted(x for x in found if x not in order))
+            self.cam_sensors = list(order + rest)
+
+        # Image-plane names must differ from cam names: Dataset.alignment() treats
+        # dst in img_sensors as "project to image" and recurses with the paired
+        # cam; if img_sensors[i] == cam_sensors[i] (Argoverse ring_* style), that
+        # recursion never terminates.
+        self.img_sensors = []
+        for n in self.cam_sensors:
+            if n.startswith('CAM_'):
+                self.img_sensors.append('IMG_' + n[len('CAM_'):])
+            else:
+                self.img_sensors.append(f'IMG_{n}')
 
     def _calibration(self, seq_idx: int, src_sensor: str, dst_sensor: str):
         if src_sensor == dst_sensor:
@@ -115,6 +179,65 @@ class SimBEV(Dataset):
             return dst2ego.inv() @ src2ego
 
         raise ValueError(f"Unsupported calibration: {src_sensor} -> {dst_sensor}")
+
+    def _resolve_camera_rotation_convention(self, convention: Any) -> str:
+        if convention in (None, 'auto'):
+            meta_value = self.metadata.get('camera_rotation_convention')
+            if isinstance(meta_value, str):
+                meta_value = meta_value.lower()
+                if meta_value in {'generated', 'original'}:
+                    return meta_value
+            return 'generated'
+
+        if isinstance(convention, bool):
+            return 'generated' if convention else 'original'
+
+        convention = str(convention).lower()
+        if convention not in {'generated', 'original'}:
+            raise ValueError(
+                'camera_rotation_convention must be one of '
+                "{'generated', 'original', 'auto'}")
+        return convention
+
+    @staticmethod
+    def _qmul_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        w1, x1, y1, z1 = a
+        w2, x2, y2, z2 = b
+        return np.array([
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+                        dtype=np.float32)
+
+    @staticmethod
+    def _qnorm_wxyz(q: np.ndarray) -> np.ndarray:
+        norm = float(np.linalg.norm(q))
+        if norm == 0.0:
+            return q
+        return q / norm
+
+    def _normalize_camera_rotations_in_metadata(self) -> None:
+        if self.camera_rotation_convention != 'generated':
+            self.metadata['camera_rotation_convention'] = 'original'
+            return
+
+        for sensor in self.cam_sensors:
+            calib = self.metadata.get(sensor)
+            if not isinstance(calib, dict):
+                continue
+
+            for field in ('sensor2ego_rotation', 'sensor2lidar_rotation'):
+                quat = calib.get(field)
+                if not isinstance(quat, (list, tuple, np.ndarray)) or len(
+                        quat) != 4:
+                    continue
+                quat = np.asarray(quat, dtype=np.float32)
+                calib[field] = self._qnorm_wxyz(
+                    self._qmul_wxyz(quat, self.CAMERA_BASE_ROTATION)).tolist()
+
+        self.metadata['camera_rotation_convention'] = 'original'
 
     def _poses(self, seq_idx: int, sensor: str) -> RigidTransform:
         return self.poses(seq_idx, sensor)
