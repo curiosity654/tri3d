@@ -6,8 +6,10 @@ already converted files. It will use **a lot** of RAM.
 """
 
 import argparse
+import concurrent.futures
 import os
 import pathlib
+import sys
 from concurrent.futures import ProcessPoolExecutor
 
 import pyarrow.parquet as pq
@@ -107,6 +109,14 @@ def convert_file(source: pathlib.Path, destination: pathlib.Path):
     tmpdest.rename(destination)
 
 
+def convert_file_safe(source: pathlib.Path, destination: pathlib.Path):
+    try:
+        convert_file(source, destination)
+    except Exception as exc:  # noqa: BLE001 - preserve error for logging
+        return (str(source), str(destination), f"{type(exc).__name__}: {exc}")
+    return None
+
+
 def main():
     argparser = argparse.ArgumentParser(description=__doc__)
     argparser.add_argument(
@@ -117,6 +127,16 @@ def main():
     )
     argparser.add_argument(
         "--workers", "-w", type=int, default=4, help="number of parallel workers"
+    )
+    argparser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="continue processing after per-file failures",
+    )
+    argparser.add_argument(
+        "--error-log",
+        type=pathlib.Path,
+        help="optional path to write failures as TSV (source, destination, error)",
     )
     args = argparser.parse_args()
 
@@ -129,13 +149,44 @@ def main():
     sources = [sources[k] for k in keep]
     destinations = [destinations[k] for k in keep]
 
-    with ProcessPoolExecutor(
-        max_workers=args.workers, max_tasks_per_child=1
-    ) as executor:
-        for _ in tqdm.tqdm(
-            executor.map(convert_file, sources, destinations), total=len(sources)
-        ):
-            pass
+    try:
+        executor = ProcessPoolExecutor(
+            max_workers=args.workers, max_tasks_per_child=1
+        )
+    except TypeError:
+        # Python < 3.11 doesn't support max_tasks_per_child in ProcessPoolExecutor.
+        executor = ProcessPoolExecutor(max_workers=args.workers)
+
+    errors: list[tuple[str, str, str]] = []
+    with executor:
+        if args.continue_on_error:
+            futures = [
+                executor.submit(convert_file_safe, s, d)
+                for s, d in zip(sources, destinations, strict=False)
+            ]
+            for future in tqdm.tqdm(
+                concurrent.futures.as_completed(futures), total=len(futures)
+            ):
+                result = future.result()
+                if result is not None:
+                    errors.append(result)
+        else:
+            for _ in tqdm.tqdm(
+                executor.map(convert_file, sources, destinations), total=len(sources)
+            ):
+                pass
+
+    if errors:
+        if args.error_log:
+            args.error_log.parent.mkdir(parents=True, exist_ok=True)
+            with args.error_log.open("w", encoding="utf-8") as handle:
+                for source, destination, error in errors:
+                    handle.write(f"{source}\t{destination}\t{error}\n")
+            print(f"Wrote {len(errors)} errors to {args.error_log}", file=sys.stderr)
+        else:
+            print(f"{len(errors)} file(s) failed:", file=sys.stderr)
+            for source, destination, error in errors:
+                print(f"{source}\t{destination}\t{error}", file=sys.stderr)
 
 
 if __name__ == "__main__":
