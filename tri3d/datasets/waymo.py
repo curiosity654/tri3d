@@ -174,12 +174,15 @@ class Waymo(Dataset):
         "STATIC",
     ]
 
-    def __init__(self, root, split="training") -> None:
+    def __init__(self, root, split="training", timeline_root=None) -> None:
         self.root = pathlib.Path(root)
+        self.timeline_root = (
+            pathlib.Path(timeline_root) if timeline_root is not None else self.root
+        )
         self.split = split
         self.records = sorted(
             a.name.removesuffix(".parquet")
-            for a in (self.root / split / "camera_box").iterdir()
+            for a in (self.timeline_root / split / "camera_box").iterdir()
         )
 
         self.timelines = []
@@ -190,7 +193,7 @@ class Waymo(Dataset):
             for i, sensor in enumerate(self.pcl_sensors, start=1):
                 record_timelines[sensor] = (
                     pq.read_table(
-                        self.root / self.split / "lidar" / (r + ".parquet"),
+                        self.timeline_root / self.split / "lidar" / (r + ".parquet"),
                         filters=[("key.laser_name", "=", i)],
                         columns=["key.frame_timestamp_micros"],
                     )["key.frame_timestamp_micros"]
@@ -202,7 +205,7 @@ class Waymo(Dataset):
 
                 record_timelines["SEG_" + sensor] = (
                     pq.read_table(
-                        self.root
+                        self.timeline_root
                         / self.split
                         / "lidar_segmentation"
                         / (r + ".parquet"),
@@ -218,7 +221,7 @@ class Waymo(Dataset):
             for i, c in enumerate(self.cam_sensors, start=1):
                 record_timelines[c] = (
                     pq.read_table(
-                        self.root / self.split / "camera_image" / (r + ".parquet"),
+                        self.timeline_root / self.split / "camera_image" / (r + ".parquet"),
                         filters=[("key.camera_name", "=", i)],
                         columns=["[CameraImageComponent].pose_timestamp"],
                     )["[CameraImageComponent].pose_timestamp"]
